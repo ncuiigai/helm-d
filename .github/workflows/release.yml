@@ -57,6 +57,15 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # The persona catalog is BUILD OUTPUT in this fork (gitignored), but the
+      # check suite reads it — api-routes.check.mjs drives GET/POST /profile and
+      # asserts the sealed catalog + its active entry. Without this step a clean
+      # checkout fails 3 checks with
+      #   ENOENT ... packages/helmd/presets/profiles.dat
+      # Generate it now; the seal step below regenerates it as part of the bundle.
+      - name: Generate persona catalog
+        run: node packages/helmd/scripts/build-profiles.mjs
+
       - name: Typecheck
         run: pnpm typecheck
 
