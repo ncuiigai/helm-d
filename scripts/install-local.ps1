@@ -92,8 +92,7 @@ try {
     }
 
     $manifestPath = Join-Path $profileDir "package.json"
-    $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-    $previousSpec = $manifest.dependencies.'@adwmc/helm-d'
+    $previousSpec = (Get-Content $manifestPath -Raw | ConvertFrom-Json).dependencies.'@adwmc/helm-d'
     $spec = if ($UseReleaseUrl) {
         $v = (Get-Content (Join-Path $repo "packages\helmd\package.json") -Raw | ConvertFrom-Json).version
         "https://github.com/ncuiigai/helm-d/releases/download/v$v/helm-d.tgz"
@@ -101,18 +100,80 @@ try {
     else {
         "file:" + ($tgz.FullName -replace '\\', '/')
     }
-    $manifest.dependencies.'@adwmc/helm-d' = $spec
-    ($manifest | ConvertTo-Json -Depth 20) | Set-Content $manifestPath -Encoding utf8 -NoNewline
+
+    # The manifest/lockfile rewrite is delegated: switching specifier SHAPES
+    # leaves pnpm's lockfile entry without an integrity field, and pnpm then
+    # refuses (ERR_PNPM_MISSING_TARBALL_INTEGRITY). fix-profile-spec.mjs drops
+    # just the helm-d lockfile blocks so `pnpm install` re-resolves that one
+    # dependency instead of the whole profile.
+    & node (Join-Path $repo "scripts\fix-profile-spec.mjs") $profileDir $spec
+    if ($LASTEXITCODE -ne 0) { throw "fix-profile-spec failed (exit $LASTEXITCODE)" }
     Write-Output "profile '$Profile' dependency: $spec"
     if ($previousSpec -and $previousSpec -ne $spec) { Write-Output "  (was: $previousSpec)" }
 
     Write-Output "installing (pnpm install)..."
     Push-Location $profileDir
     try {
-        pnpm install 2>&1 | Select-Object -Last 4
-        if ($LASTEXITCODE -ne 0) {
+        # Capture the exit code before any pipeline runs: `pnpm ... | Select-Object`
+        # leaves $LASTEXITCODE pointing at pnpm, but keeping the raw output lets a
+        # failure print the actual reason instead of a bare exit code.
+        $installOut = pnpm install 2>&1
+        $installCode = $LASTEXITCODE
+
+        # Switching specifier SHAPES (file: <-> https URL) drops the lockfile
+        # entry's `integrity` field, and pnpm then refuses to install:
+        #   ERR_PNPM_MISSING_TARBALL_INTEGRITY ... cannot verify the downloaded tarball
+        # The fix is to recompute the digest of the exact tarball and write it back
+        # rather than regenerating the whole lockfile (which would re-resolve every
+        # other dependency in the profile).
+        if ($installCode -ne 0 -and ($installOut -join "`n") -match 'MISSING_TARBALL_INTEGRITY') {
+            Write-Output "  lockfile lost the integrity field for the new specifier; recomputing..."
+            $lockPath = Join-Path $profileDir "pnpm-lock.yaml"
+
+            # Hash the artifact the SPECIFIER names, not "some tarball we have".
+            # The sealed blobs use a random IV, so a local rebuild and the release
+            # asset built from the same sources are different bytes — hashing the
+            # wrong one produces a lockfile that fails with ERR_PNPM_TARBALL_INTEGRITY
+            # ("Wanted sha512-RhPd… Got sha512-CQ4O…").
+            if ($spec -match '^https?://') {
+                $hashSrc = Join-Path $env:TEMP ("helmd-integrity-" + [guid]::NewGuid().ToString('N') + ".tgz")
+                Write-Output "  downloading the release asset to hash it..."
+                Invoke-WebRequest -Uri $spec -OutFile $hashSrc -UseBasicParsing
+            }
+            else {
+                $hashSrc = $tgz.FullName
+            }
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($hashSrc)
+                $sha512 = [System.Security.Cryptography.SHA512]::Create().ComputeHash($bytes)
+                $digest = "sha512-" + [Convert]::ToBase64String($sha512)
+            }
+            finally {
+                if ($hashSrc -ne $tgz.FullName) { Remove-Item $hashSrc -Force -ErrorAction SilentlyContinue }
+            }
+
+            $lock = Get-Content $lockPath -Raw
+            $key = "@adwmc/helm-d@$spec"
+            # Replace the resolution line for THIS package only, leaving every
+            # other importer/package entry untouched.
+            $pattern = "(?ms)^(  '" + [regex]::Escape($key) + "':\r?\n    resolution: )\{[^}]*\}"
+            if ($lock -notmatch $pattern) { throw "cannot locate the lockfile resolution line for $key" }
+            $lock = $lock -replace $pattern, ('$1' + '{integrity: ' + $digest + ', tarball: ' + $spec + '}')
+            Set-Content -Path $lockPath -Value $lock -Encoding utf8 -NoNewline
+            Write-Output "  wrote integrity $($digest.Substring(0, 20))... for $key"
+
+            $installOut = pnpm install 2>&1
+            $installCode = $LASTEXITCODE
+        }
+
+        $installOut | Select-Object -Last 4
+        if ($installCode -ne 0) {
+            Write-Output ""
+            Write-Output "pnpm install output (last 20 lines):"
+            $installOut | Select-Object -Last 20
             Copy-Item (Join-Path $backupDir "profile-$Profile-package.json.$stamp.bak") $manifestPath -Force
-            throw "pnpm install failed (exit $LASTEXITCODE); profile manifest restored"
+            Copy-Item (Join-Path $backupDir "profile-$Profile-pnpm-lock.yaml.$stamp.bak") $lockPath -Force
+            throw "pnpm install failed (exit $installCode); profile manifest + lockfile restored from backup"
         }
     }
     finally { Pop-Location }
