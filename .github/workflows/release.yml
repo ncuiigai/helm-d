@@ -1,0 +1,120 @@
+name: Release
+
+# Builds the sealed bundle on GitHub's runners and attaches it to a release.
+#
+# Why this workflow exists at all: this fork keeps `payload.dat` /
+# `references.dat` / `presets/profiles.dat` OUT of git (they are AES blobs whose
+# bytes change on every regeneration, so they are unmergeable, and push
+# protection intermittently flags the regenerated reference bundle). The tarball
+# therefore has to be produced where a build can run — here — instead of being
+# committed.
+#
+# Trigger:
+#   - push a tag `v*`            -> build + create/refresh the GitHub release
+#   - Actions > Release > Run    -> build only, asset available as a run artifact
+#
+# Ordering matters: the check suite imports packages/helmd/dist/*.js directly,
+# and build-sealed.mjs MOVES every compiled module into .real/ leaving
+# self-extracting stubs. Running the checks after sealing turns the host-dependent
+# ones into SKIP ("need packages/helmd/dist (run pnpm build)") — a green-looking
+# suite that proved nothing. So: build -> typecheck -> checks -> seal -> verify.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build + pack (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Checks (pre-seal: dist/*.js must still be plaintext)
+        run: node scripts/checks/run-all.mjs
+
+      - name: Seal persona catalog + payload + references
+        run: |
+          node packages/helmd/scripts/build-profiles.mjs
+          node packages/helmd/scripts/build-sealed.mjs
+
+      - name: Verify sealed package shape
+        run: node scripts/verify-pack.mjs --require-sealed
+
+      - name: Pack
+        id: pack
+        shell: pwsh
+        run: |
+          $version = (Get-Content packages/helmd/package.json -Raw | ConvertFrom-Json).version
+          New-Item -ItemType Directory -Force dist-tgz | Out-Null
+          Push-Location packages/helmd
+          npm pack --pack-destination ../../dist-tgz
+          Pop-Location
+          $tgz = Get-ChildItem dist-tgz -Filter "adwmc-helm-d-*.tgz" | Select-Object -First 1
+          if (-not $tgz) { throw "npm pack produced no tarball" }
+          # Stable asset name so the documented URL shape stays
+          # releases/download/<tag>/helm-d.tgz
+          Copy-Item $tgz.FullName dist-tgz/helm-d.tgz -Force
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$((Get-FileHash dist-tgz/helm-d.tgz -Algorithm SHA256).Hash.ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Get-ChildItem dist-tgz | Select-Object Name, Length
+
+      - name: Self-check the packed tarball
+        run: node scripts/check-tarball.mjs dist-tgz/helm-d.tgz fiction
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helmd-${{ steps.pack.outputs.version }}
+          path: dist-tgz/helm-d.tgz
+          if-no-files-found: error
+
+      - name: Create or refresh the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = "${{ steps.pack.outputs.version }}"
+          $sha = "${{ steps.pack.outputs.sha256 }}"
+          $expectedTag = "v$version"
+          if ($tag -ne $expectedTag) {
+            throw "tag $tag does not match package version $version (expected tag $expectedTag)"
+          }
+          $notes = "Sealed bundle built from $tag ($env:GITHUB_SHA).`n`n``helm-d.tgz`` sha256: ``$sha```n`nThis is a fork build: it carries the creative-writing profiles (fiction / fiction-t5 / fiction-t2) and leaves upstream's security tooling intact."
+          if (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null) {
+            gh release upload $tag dist-tgz/helm-d.tgz --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag dist-tgz/helm-d.tgz --title "helm-d $tag (fork)" --notes $notes --repo $env:GITHUB_REPOSITORY
+          }
