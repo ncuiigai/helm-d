@@ -1,24 +1,28 @@
 # Pack this fork and install it into a DSH profile.
 #
-#   .\scripts\install-local.ps1                     # pack + install into profile "desktop"
+#   .\scripts\install-local.ps1                     # build + pack + install (file: tarball)
+#   .\scripts\install-local.ps1 -UseReleaseUrl      # install from the GitHub release instead
 #   .\scripts\install-local.ps1 -Profile web        # another profile
 #   .\scripts\install-local.ps1 -PackOnly           # just produce the tgz and print its path
 #   .\scripts\install-local.ps1 -NoBuild            # reuse the last tgz in dist-tgz/
+#   .\scripts\install-local.ps1 -SkipChecks         # fast loop: build + seal, no gate
 #
 # Why not `npm pack` from a clean clone: the package ships SEALED artifacts
 # (payload.dat / references.dat / profiles.dat). They must be regenerated from
 # this fork's sources before packing, or the installed plugin runs upstream's
 # personas with the fork's profiles/*.md sitting unused on disk.
 #
-# Install path: `dsh plugin add <tgz>` copies the tarball into the profile's
-# node_modules. Because the tarball is self-contained, an upstream release can't
-# silently overwrite it — only an explicit `dsh plugin add` of another tarball can.
+# Why not `dsh plugin add`: the Electron app owns the "desktop" profile and
+# refuses ("profile \"desktop\" is managed exclusively by the Electron
+# application"). Install path is the profile manifest + pnpm install, which is
+# exactly what the app itself does.
 
 param(
     [string]$Profile = "desktop",
     [switch]$PackOnly,
     [switch]$NoBuild,
-    [switch]$SkipChecks
+    [switch]$SkipChecks,
+    [switch]$UseReleaseUrl
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,32 +77,53 @@ try {
     $profileDir = Join-Path $dshHome "profiles\$Profile"
     if (-not (Test-Path $profileDir)) { throw "profile not found: $profileDir" }
 
-    # Back up the tarball currently installed in the profile, so a bad build can
-    # be rolled back without re-downloading upstream's release.
-    $installedPkg = Join-Path $profileDir "node_modules\@adwmc\helm-d\package.json"
-    if (Test-Path $installedPkg) {
-        $oldVersion = (Get-Content $installedPkg -Raw | ConvertFrom-Json).version
-        $backupDir = Join-Path $repo ".backup"
-        New-Item -ItemType Directory -Force $backupDir | Out-Null
-        $backupTgz = Join-Path $backupDir "helmd-$oldVersion-$(Get-Date -Format 'yyyyMMdd-HHmmss').tgz"
-        Push-Location (Join-Path $profileDir "node_modules\@adwmc\helm-d")
-        try {
-            cmd /c "npm pack --pack-destination `"$backupDir`" 2>&1" | Out-Null
-            $made = Get-ChildItem $backupDir -Filter "adwmc-helm-d-*.tgz" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($made) { Move-Item $made.FullName $backupTgz -Force }
-        }
-        finally { Pop-Location }
-        if (Test-Path $backupTgz) { Write-Output "previous install backed up: $backupTgz" }
+    # `dsh plugin --profile <name> add` refuses the Electron-managed profile:
+    #   error: profile "desktop" is managed exclusively by the Electron application
+    # So install the way the app itself does: point the profile manifest at the
+    # tarball and let pnpm resolve it. Both the manifest and the lockfile are
+    # backed up first, because a bad tarball must be one `git checkout` away
+    # from undone.
+    $backupDir = Join-Path $repo ".backup"
+    New-Item -ItemType Directory -Force $backupDir | Out-Null
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    foreach ($f in @("package.json", "pnpm-lock.yaml")) {
+        $src = Join-Path $profileDir $f
+        if (Test-Path $src) { Copy-Item $src (Join-Path $backupDir "profile-$Profile-$f.$stamp.bak") -Force }
     }
 
-    Write-Output "installing into profile '$Profile'..."
-    if (Get-Command dsh -ErrorAction SilentlyContinue) {
-        & dsh plugin --profile $Profile add $tgz.FullName
+    $manifestPath = Join-Path $profileDir "package.json"
+    $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+    $previousSpec = $manifest.dependencies.'@adwmc/helm-d'
+    $spec = if ($UseReleaseUrl) {
+        $v = (Get-Content (Join-Path $repo "packages\helmd\package.json") -Raw | ConvertFrom-Json).version
+        "https://github.com/ncuiigai/helm-d/releases/download/v$v/helm-d.tgz"
     }
     else {
-        & npx --yes @deepseek-ai/dsh plugin --profile $Profile add $tgz.FullName
+        "file:" + ($tgz.FullName -replace '\\', '/')
     }
-    if ($LASTEXITCODE -ne 0) { throw "dsh plugin add failed (exit $LASTEXITCODE)" }
+    $manifest.dependencies.'@adwmc/helm-d' = $spec
+    ($manifest | ConvertTo-Json -Depth 20) | Set-Content $manifestPath -Encoding utf8 -NoNewline
+    Write-Output "profile '$Profile' dependency: $spec"
+    if ($previousSpec -and $previousSpec -ne $spec) { Write-Output "  (was: $previousSpec)" }
+
+    Write-Output "installing (pnpm install)..."
+    Push-Location $profileDir
+    try {
+        pnpm install 2>&1 | Select-Object -Last 4
+        if ($LASTEXITCODE -ne 0) {
+            Copy-Item (Join-Path $backupDir "profile-$Profile-package.json.$stamp.bak") $manifestPath -Force
+            throw "pnpm install failed (exit $LASTEXITCODE); profile manifest restored"
+        }
+    }
+    finally { Pop-Location }
+
+    # Post-install proof: the installed catalog must be this fork's.
+    $verify = Join-Path $repo "scripts\check-tarball.mjs"
+    $installedDat = Join-Path $profileDir "node_modules\@adwmc\helm-d\presets\profiles.dat"
+    if (Test-Path $installedDat) {
+        $dat = Get-Content $installedDat -Raw | ConvertFrom-Json
+        Write-Output "installed catalog: activeId=$($dat.activeId)  profiles=$($dat.profiles.Count)"
+    }
 
     Write-Output ""
     Write-Output "installed. Restart dsh to load the new catalog, then check:"
