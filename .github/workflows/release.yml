@@ -60,7 +60,7 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Checks (pre-seal: dist/*.js must still be plaintext)
+      - name: "Checks (pre-seal — dist/*.js must still be plaintext)"
         run: node scripts/checks/run-all.mjs
 
       - name: Seal persona catalog + payload + references
