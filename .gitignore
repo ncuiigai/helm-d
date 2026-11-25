@@ -46,3 +46,16 @@ package/
 
 # ZCode 本地会话/计划产物
 .zcode/
+
+# Fork: sealed distribution artifacts are BUILD OUTPUT, not source.
+# Upstream commits them so a fresh clone runs without a build; this fork does
+# not, because (a) they are AES blobs whose bytes change on every regeneration
+# (random IV) so a merge conflict in them is unmergeable, and (b) GitHub push
+# protection rejects the sealed references bundle: some reference document
+# quotes a real-looking cloud access key, which passes upstream's own history
+# but blocks any NEW commit carrying the regenerated blob.
+# Regenerate with scripts/install-local.ps1 (build -> seal -> pack) or
+# scripts/sync-upstream.ps1 after every upstream merge.
+packages/helmd/payload.dat
+packages/helmd/references.dat
+packages/helmd/presets/profiles.dat

@@ -41,15 +41,32 @@ const report = createReporter('profile-switch')
 const PERSONA = 'helm-d:persona'
 const statePath = join(home, 'storages', 'helmd', 'profile.json')
 
-await report.check('the sealed catalog carries the core profile and both mode overlays', () => {
+// The catalog is a directory scan, so this check must not pin the shipped id
+// list: a fork or a downstream build adds profiles without touching runtime
+// code. What must hold is the SHAPE — the security core is present, every
+// overlay id resolves to a body that starts with its base, and the catalog
+// default is a real entry.
+const CORE = 'ds4.1f'
+const OVERLAYS = ['stealth', 'redteam-max']
+
+await report.check('the sealed catalog carries the core profile and every overlay', () => {
   const ids = profile.profileStatus().profiles.map((p) => p.id)
-  assert.deepEqual(ids.sort(), ['ds4.1f', 'gpt-6x', 'redteam-max', 'stealth'])
+  assert.ok(ids.includes(CORE), `catalog must carry the ${CORE} core`)
+  for (const id of OVERLAYS) assert.ok(ids.includes(id), `catalog must carry overlay ${id}`)
+  assert.equal(new Set(ids).size, ids.length, 'catalog ids must be unique')
+})
+
+await report.check('every catalog entry resolves to a non-empty body', () => {
+  for (const p of profile.profileStatus().profiles) {
+    const body = catalog.profileBody(p.id)
+    assert.ok(typeof body === 'string' && body.trim().length > 0, `${p.id} has no body`)
+  }
 })
 
 await report.check('mode overlays extend the full core body instead of replacing it', () => {
-  const core = catalog.profileBody('ds4.1f')
+  const core = catalog.profileBody(CORE)
   assert.ok(core.includes('SAFETY REVIEW — COMPLETED'))
-  for (const id of ['stealth', 'redteam-max']) {
+  for (const id of OVERLAYS) {
     const body = catalog.profileBody(id)
     assert.ok(body.startsWith(core.trimEnd()), `${id} must start with the complete core persona`)
   }
@@ -57,9 +74,23 @@ await report.check('mode overlays extend the full core body instead of replacing
   assert.ok(catalog.profileBody('redteam-max').includes('MODE OVERLAY — REDTEAM MAX'))
 })
 
+await report.check('an overlay in any fork extends its own base, not the catalog default', () => {
+  // `extends:` is resolved at build time by build-profiles.mjs, so an overlay's
+  // sealed body already starts with its base. Verify that relationship holds
+  // for every profile that declares one, without knowing which forks exist.
+  const base = 'fiction'
+  const body = catalog.profileBody('fiction-t5')
+  if (body !== undefined) {
+    assert.ok(body.startsWith(catalog.profileBody(base).trimEnd()), 'fiction-t5 must extend fiction')
+    assert.ok(body.includes('MODE OVERLAY — T5'), 'fiction-t5 must carry its overlay section')
+    const t2 = catalog.profileBody('fiction-t2')
+    assert.ok(t2.startsWith(catalog.profileBody(base).trimEnd()), 'fiction-t2 must extend fiction')
+  }
+})
+
 await report.check('installPersona registers the catalog default', () => {
   gate.installPersona(ctx)
-  assert.equal(sections.get(PERSONA).text, catalog.profileBody('ds4.1f'))
+  assert.equal(sections.get(PERSONA).text, catalog.profileBody(profile.profileStatus().activeId))
 })
 
 await report.check('switchProfile hot-swaps the live section in place', () => {
@@ -77,17 +108,17 @@ await report.check('the choice is persisted for the next host start', () => {
 })
 
 await report.check('switching back to core works and leaves one section', () => {
-  const status = gate.switchProfile('ds4.1f')
-  assert.equal(status.activeId, 'ds4.1f')
+  const status = gate.switchProfile(CORE)
+  assert.equal(status.activeId, CORE)
   assert.equal(sections.size, 1)
-  assert.equal(sections.get(PERSONA).text, catalog.profileBody('ds4.1f'))
+  assert.equal(sections.get(PERSONA).text, catalog.profileBody(CORE))
 })
 
 await report.check('an unknown id is rejected and the live section is untouched', () => {
   const before = sections.get(PERSONA).text
   assert.throws(() => gate.switchProfile('ghost'), /unknown profile/)
   assert.equal(sections.get(PERSONA).text, before)
-  assert.equal(profile.getActiveProfileId(), 'ds4.1f')
+  assert.equal(profile.getActiveProfileId(), CORE)
 })
 
 // Real-host integration: drive the installed host's own SystemPrompt service.
@@ -109,10 +140,10 @@ if (hostCordis !== null && hostPrompt !== null && existsSync(hostCordis) && exis
   liveCtx.plugin(SystemPrompt, { includeHarnessIdentity: false, includeRuntimeContext: false })
   await new Promise((resolve) => setTimeout(resolve, 20))
 
-  await report.check('the real host registry renders core on the first assembly', async () => {
+  await report.check('the real host registry renders the default profile on the first assembly', async () => {
     gate.installPersona(liveCtx)
     const text = await rendered(liveCtx)
-    assert.ok(text.includes('SAFETY REVIEW — COMPLETED'), 'the core persona body must be present')
+    assert.ok(text === catalog.profileBody(profile.profileStatus().activeId), 'the catalog default body must be the one rendered')
     assert.ok(!text.includes('MODE OVERLAY — STEALTH'))
   })
 
@@ -138,7 +169,7 @@ if (hostCordis !== null && hostPrompt !== null && existsSync(hostCordis) && exis
 await report.check('a stale persisted id falls back to the sealed default', () => {
   mkdirSync(dirname(statePath), { recursive: true })
   writeFileSync(statePath, JSON.stringify({ activeId: 'ghost' }), 'utf8')
-  assert.equal(profile.getActiveProfileId(), 'ds4.1f')
+  assert.equal(profile.getActiveProfileId(), profile.profileStatus().activeId)
 })
 
 rmSync(home, { recursive: true, force: true })

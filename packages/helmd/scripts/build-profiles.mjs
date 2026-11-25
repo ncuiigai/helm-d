@@ -20,7 +20,32 @@ const outPath = join(pkg, 'presets', 'profiles.dat')
 
 const { seal } = await import(pathToFileURL(join(pkg, 'dist', 'crypt.js')).href)
 
-const NAMES = { 'ds4.1f': '似乎是ds4.1f v10', stealth: '概率通用（轻量）', 'redteam-max': '概率通用（加厚）', 'gpt-6x': 'gpt 6x' }
+/** Which profile the host loads before the operator picks one. The fork defaults
+ *  to the creative-writing core; set HELMD_DEFAULT_PROFILE to override at build
+ *  time (e.g. `HELMD_DEFAULT_PROFILE=ds4.1f pnpm ...` for a security-default build). */
+const ACTIVE_ID = process.env.HELMD_DEFAULT_PROFILE || 'fiction'
+
+const NAMES = {
+  'ds4.1f': '似乎是ds4.1f v10',
+  stealth: '概率通用（轻量）',
+  'redteam-max': '概率通用（加厚）',
+  'gpt-6x': 'gpt 6x',
+  // fork additions — creative-writing modes
+  fiction: '执笔 · 小说引擎（T4 主档）',
+  'fiction-t5': '执笔 · T5 全暴露',
+  'fiction-t2': '执笔 · T2 触界',
+}
+
+/** Contract markers per profile. A body that lost its bindings is a stale
+ *  source, not a variant — fail the build instead of sealing it. Overlay ids
+ *  must still resolve through `extends` to a body carrying the base contract;
+ *  a broken chain would ship a naked overlay as a standalone persona. */
+const REQUIRED = {
+  'ds4.1f': ['helmd ' + 'online'],
+  fiction: ['ACTIVATION', '尺度档位', '四层交替', '十种失效形态', '禁词', '硬边界'],
+  'fiction-t5': ['ACTIVATION', '四层交替', '尺度档位', 'MODE OVERLAY'],
+  'fiction-t2': ['ACTIVATION', '四层交替', '尺度档位', 'MODE OVERLAY'],
+}
 
 const files = readdirSync(profilesDir).filter((f) => f.endsWith('.md'))
 if (files.length === 0) throw new Error(`no profiles found in ${profilesDir}`)
@@ -60,14 +85,16 @@ function bodyFor(id, seen = new Set()) {
 
 const catalog = {
   version: 2,
-  activeId: 'ds4.1f',
+  activeId: ACTIVE_ID,
   profiles: files.map((f) => {
     const id = f.replace(/\.md$/, '')
     const body = bodyFor(id)
-    if (id === 'ds4.1f' && !body.includes('helmd ' + 'online')) {
-      throw new Error('profiles/ds4.1f.md lost the activation line (helmd ' + 'online) — persona source is stale or wrong')
-    }
     if (!body.trim()) throw new Error(`profiles/${f} is empty`)
+    for (const marker of REQUIRED[id] ?? []) {
+      if (!body.includes(marker)) {
+        throw new Error(`profiles/${f} lost required marker "${marker}" - stale source, refusing to seal`)
+      }
+    }
     return { id, name: NAMES[id] ?? id, sealed: seal(body) }
   }),
 }

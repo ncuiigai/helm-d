@@ -340,6 +340,10 @@ exports.apply = function apply(ctx) {
 		stealth: { tag: "轻量隐匿", desc: "最小输出 · 只读优先 · 单目标收敛" },
 		"redteam-max": { tag: "渗透加厚", desc: "全链路攻击 · 攻防双栏 · 产物成套" },
 		"gpt-6x": { tag: "CTF 沙箱", desc: "Helm-X v6 独立主档 · 计分 / 四角色交付 · DSH 未实测" },
+		// fork: creative-writing modes
+		fiction: { tag: "小说主档", desc: "T4 逐帧 · 四层交替 · 十种失效判定 · 禁词表" },
+		"fiction-t5": { tag: "小说加厚", desc: "T5 全暴露 · 内部体感 · 体液与粗口原样" },
+		"fiction-t2": { tag: "小说收敛", desc: "T2 触界 · 收束不跳接 · 张力走反应层" },
 	};
 
 	const WORKBENCH_CSS = [
