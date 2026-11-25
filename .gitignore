@@ -59,3 +59,7 @@ package/
 packages/helmd/payload.dat
 packages/helmd/references.dat
 packages/helmd/presets/profiles.dat
+
+# Profile manifest/lockfile backups written by install-local.ps1
+.backup/
+
